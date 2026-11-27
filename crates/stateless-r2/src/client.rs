@@ -19,9 +19,12 @@ pub enum R2Error {
     /// connection timeout or reset. The endpoint is effectively unreachable, so the caller
     /// should back off before retrying.
     Transport(String),
-    /// The endpoint asked us to slow down (`429`) or returned a server-side error (`5xx`,
-    /// including R2's `503` overload / `SlowDown`). Retrying without a backoff would keep
-    /// hammering a struggling endpoint, so the caller should back off.
+    /// The endpoint rate-limited us (`429`, R2's `TooManyRequests`) or returned a server-side
+    /// error (`5xx`, including R2's `503` `ServiceUnavailable`, which R2 documents as a temporary
+    /// unavailability rather than a rate limit). Retrying without a backoff would keep
+    /// hammering a struggling endpoint, so the caller should back off. Only a `429` says
+    /// anything about this client's own load: a caller that pauses all of its requests, rather
+    /// than backing off the one that failed, decides that from `status`, not from this variant.
     Throttled {
         /// HTTP status code returned by R2.
         status: u16,
@@ -98,9 +101,10 @@ pub async fn put_object(
     classify_response(response).await
 }
 
-/// Whether a non-success status (`429` or any `5xx`) is backoff-worthy throttling, as opposed to
-/// one that will not clear on retry. The single definition of the throttle set — the write path
-/// (`classify_response`) and the validator's R2 reader both classify with it.
+/// Whether a non-success status (`429` or any `5xx`) is backoff-worthy (a rate limit or a
+/// server-side error), as opposed to one that will not clear on retry. The single definition of the
+/// throttle set — the write path (`classify_response`) and the validator's R2 reader both classify
+/// with it.
 pub const fn is_throttle_status(status: u16) -> bool {
     status == 429 || status >= 500
 }
