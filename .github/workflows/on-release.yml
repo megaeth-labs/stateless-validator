@@ -1,24 +1,29 @@
 name: On Release
 
-# Publish target for a stateless-validator release: the two binaries as
-# downloads on the GitHub Release page, with a SHA256SUMS file. Runs when the
-# release pipeline publishes the Release (release-settle creates it right
-# after the tag), and on demand for a rehearsal on a tag ref:
+# Publish target for a stateless-validator release: the two binaries, taken
+# from the GitHub Release, to the MegaETH Artifact Registry. Runs when the
+# release pipeline publishes the Release, and on demand for a rehearsal on a
+# tag ref:
 #   gh workflow run on-release.yml --ref vX.Y.Z -f dry_run=true
 # The tag being released is always the run's own ref; there is no tag input.
+#
+# Nothing is built here. release-settle builds the binaries and publishes the
+# Release with them and a SHA256SUMS file already attached (a published Release
+# is immutable, so nothing can be attached from this workflow), and the
+# registry gets those same bytes. The Release also outlives any wait for the
+# reviewer, unlike a workflow artifact with a short retention. A rehearsal
+# therefore needs a tag whose Release carries these files.
 #
 # This file must exist on the release branch: a `release` event resolves the
 # workflow from the tagged commit's tree, not from the default branch, and the
 # tag sits on the release branch. A branch cut from a default branch that has
 # this file carries it; a branch cut before it landed needs it cherry-picked
 # (via its own PR — the `release-*` ruleset requires one) before release-settle
-# is dispatched, or the Release publishes with nothing attached and no failed
-# run; release-settle warns when the tip lacks a workflow main has.
+# is dispatched, or the registry upload is skipped with no failed run;
+# release-settle warns when the tip lacks a workflow main has.
 # A rehearsal likewise only works on a tag whose tree has this file.
 #
-# Targets, fed by one build so the Release page and the registry carry the
-# same bytes:
-#   assets   — both binaries + SHA256SUMS as downloads on the Release page
+# Target:
 #   registry — both binaries to the MegaETH Artifact Registry (generic repo
 #              megaeth-generic-registry), replacing the former release.yaml /
 #              release-tracing.yaml. The layout is the one deployment reads:
@@ -37,13 +42,13 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build and checksum everything; attach nothing"
+        description: "Download and checksum the Release binaries; upload nothing"
         required: false
         type: boolean
         default: true
 
-# One run per tag: a release run and a dispatch on the same tag both end in a
-# `--clobber` upload (delete-then-upload), so overlapping runs would race.
+# One run per tag: a release run and a dispatch on the same tag upload to the
+# same registry paths, so overlapping runs would race.
 # Never cancel an upload mid-flight; queue instead.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -58,85 +63,23 @@ env:
   DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
 
 jobs:
-  build:
+  registry:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
+    environment: release
     steps:
       - name: Require a tag ref
         run: |
           [[ "$GITHUB_REF_TYPE" == "tag" ]] || { echo "::error::this workflow publishes the run's own ref, which must be a tag (got $GITHUB_REF_TYPE $GITHUB_REF_NAME); dispatch it with --ref vX.Y.Z"; exit 1; }
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ env.TAG }}
-          persist-credentials: false
-
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          cache: false
-
-      - uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1
-
-      - name: Build
-        run: cargo build --release --locked --bin stateless-validator --bin debug-trace-server
-
-      # stateless-validator carries a clap version (`#[clap(version)]`), so
-      # it is a gate: the built binary must report the tag's version, which
-      # also catches a tag / Cargo.toml mismatch nothing else checks here.
-      - uses: megaeth-labs/.github/.github/actions/release-verify-version@main
-        with:
-          command: target/release/stateless-validator --version
-          version: ${{ env.TAG }}
-          dry_run: ${{ env.DRY_RUN }}
-
-      # debug-trace-server carries a clap version too (added for this gate).
-      # The workspace builds clap without its `help` feature, so `--version`
-      # is the only flag either binary answers; `--help` is an error.
-      - uses: megaeth-labs/.github/.github/actions/release-verify-version@main
-        with:
-          command: target/release/debug-trace-server --version
-          version: ${{ env.TAG }}
-          dry_run: ${{ env.DRY_RUN }}
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: binaries
-          path: |
-            target/release/stateless-validator
-            target/release/debug-trace-server
-          if-no-files-found: error
-          retention-days: 1
-
-  assets:
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write # release-assets attaches to the Release
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: binaries
-          path: target/release
-
-      - uses: megaeth-labs/.github/.github/actions/release-assets@main
-        with:
-          tag: ${{ env.TAG }}
-          files: |
-            target/release/stateless-validator
-            target/release/debug-trace-server
-          dry_run: ${{ env.DRY_RUN }}
-
-  registry:
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    environment: release
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: binaries
-          path: target/release
+      - name: Download the Release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir target/release \
+            --pattern stateless-validator --pattern debug-trace-server --pattern SHA256SUMS
+          cd target/release
+          sha256sum --check --strict SHA256SUMS
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
